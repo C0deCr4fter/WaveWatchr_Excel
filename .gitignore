@@ -3,3 +3,4 @@ env/
 __pycache__/
 data/*.xlsx
 .env
+credentials/*.json
