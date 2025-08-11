@@ -2,16 +2,15 @@ name: Fetch buoy data and update Google Sheet
 
 on:
   schedule:
-    - cron: "*/30 * * * *" # every 30 minutes
-  workflow_dispatch: # allow manual run from Actions tab
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:         # allow manual run from Actions tab
 
 jobs:
   fetch-and-write:
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -26,8 +25,13 @@ jobs:
       - name: Create Google credentials file
         run: |
           mkdir -p credentials
-          echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}" > credentials/google-service-account.json
+          # write the multi-line JSON exactly as stored in the secret
+          cat > credentials/google-service-account.json << 'EOF'
+          ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+          EOF
 
       - name: Run fetch and write
-        run: python fetch_and_write.py
-
+        env:
+          GOOGLE_SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/credentials/google-service-account.json
+        run: |
+          python fetch_and_write.py
