@@ -1,0 +1,11 @@
+{
+  "stations": ["41117"],
+  "fields": [
+    "timestamp_utc",
+    "wave_height_ft",
+    "dominant_period_s",
+    "wind_speed_kt",
+    "wind_dir_deg",
+    "wind_direction"
+  ]
+}
