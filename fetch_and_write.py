@@ -20,14 +20,13 @@ import os
 import sys
 import json
 import math
-import time
 import typing as T
 from datetime import datetime, timezone
 
 import requests
 
 from sheet_tools import (
-    get_sheets_service,
+    get_sheets_service,   # NOTE: requires sa_path argument
     ensure_tab,
     append_rows,
     write_status,
@@ -112,15 +111,16 @@ def load_config() -> dict:
 
 def to_iso_utc(year: int, mo: int, dy: int, hr: int, mn: int) -> str:
     dt = datetime(year, mo, dy, hr, mn, tzinfo=timezone.utc)
+    # keep "+00:00" suffix explicit
     return dt.isoformat().replace("+00:00", "+00:00")
 
 
 def deg_to_cardinal(deg: T.Optional[float]) -> T.Optional[str]:
-    if deg is None or math.isnan(deg):
+    if deg is None or (isinstance(deg, float) and math.isnan(deg)):
         return None
     dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
             "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-    ix = int((deg % 360) / 22.5 + 0.5) % 16
+    ix = int((float(deg) % 360) / 22.5 + 0.5) % 16
     return dirs[ix]
 
 
@@ -176,76 +176,54 @@ def fetch_latest_observation(station: str) -> dict:
 
     # Parse standard file (..../<station>.txt)
     # Header (reference): YY  MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD PRES ATMP WTMP DEWP VIS TIDE
-    # Values are newest-first, space-separated.
     if std_line:
         parts = _parse_fixed_width_line(std_line)
-        # Guard: we expect at least first 10-12 fields
         if len(parts) >= 11:
             yr, mo, dy, hh, mn = map(int, parts[0:5])
-            wdir = safe_float(parts[5])   # degT
-            wspd = safe_float(parts[6])   # m/s in some feeds; NDBC doc says m/s; BUT many users treat as knots.
-            # NDBC realtime2 WSPD is meters/second for some buoys; NDBC site often provides knots in separate feeds.
-            # Empirically many consumers expect knots; if value seems too small, multiply by 1.94384 to convert m/s→kt.
-            # We do a light heuristic: if wspd is not None and wspd < 25 and any WVHT exists, we assume m/s.
-            wvht_m = safe_float(parts[8])  # meters
-            dpd = safe_float(parts[9])     # seconds
+            wdir = safe_float(parts[5])
+            wspd = safe_float(parts[6])   # likely m/s; we'll convert to kt
+            wvht_m = safe_float(parts[8])
+            dpd = safe_float(parts[9])
             mwd = safe_float(parts[11]) if len(parts) > 11 else None
 
-            # timestamp
             result["timestamp_utc"] = to_iso_utc(2000 + yr if yr < 100 else yr, mo, dy, hh, mn)
-
-            # wave height feet
             result["wave_height_ft"] = round_1(m_to_ft(wvht_m))
-
-            # dominant period seconds
             result["dominant_period_s"] = round_1(dpd)
 
-            # wind
-            wind_dir_deg = wdir
             wind_speed_kt = None
             if wspd is not None:
-                # Heuristic m/s → kt
-                wind_speed_kt = round(float(wspd) * 1.94384)  # integer knots is fine for display
+                wind_speed_kt = round(float(wspd) * 1.94384)  # m/s → kt
 
-            result["wind_dir_deg"] = wind_dir_deg
+            result["wind_dir_deg"] = wdir
             result["wind_speed_kt"] = wind_speed_kt
-            result["wind_direction"] = deg_to_cardinal(wind_dir_deg)
+            result["wind_direction"] = deg_to_cardinal(wdir)
             result["mean_wave_dir_deg"] = mwd
 
     # Parse spectral file (..../<station>.spec)
-    # Header (reference):
+    # Header:
     # YY  MM DD hh mm WVHT  SwH  SwP  WWH  WWP SwD WWD  STEEPNESS  APD MWD
     if spec_line:
         parts = _parse_fixed_width_line(spec_line)
         if len(parts) >= 10:
-            # Not re-reading timestamp here; std timestamp is sufficient.
-            wvht_m = safe_float(parts[5])  # meters
-            swh_m = safe_float(parts[6])   # meters (swell height)
-            swp_s = safe_float(parts[7])   # seconds (swell period)
-            # SwD and WWD are compass strings in some files; MWD appears near end as degrees
-            # Try to capture MWD at tail if present
+            swh_m = safe_float(parts[6])   # SwH (m)
+            swp_s = safe_float(parts[7])   # SwP (s)
+            # MWD often appears as the last numeric
             try:
-                mwd = safe_float(parts[-1])
+                mwd_tail = safe_float(parts[-1])
             except Exception:
-                mwd = None
+                mwd_tail = None
 
-            # Merge/augment
             result["swell_height_ft"] = round_1(m_to_ft(swh_m))
             result["swell_period_s"] = round_1(swp_s)
-            if "wave_height_ft" not in result or result["wave_height_ft"] is None:
-                result["wave_height_ft"] = round_1(m_to_ft(wvht_m))
-            if result.get("mean_wave_dir_deg") is None and mwd is not None:
-                result["mean_wave_dir_deg"] = mwd
+            if result.get("mean_wave_dir_deg") is None and mwd_tail is not None:
+                result["mean_wave_dir_deg"] = mwd_tail
 
     return result
 
 
 def build_row(fields: T.List[str], obs: dict) -> T.List[T.Any]:
     """Return a list of values in the same order as fields."""
-    out: T.List[T.Any] = []
-    for key in fields:
-        out.append(obs.get(key))
-    return out
+    return [obs.get(k) for k in fields]
 
 
 def any_alerts_for_row(row_dict: dict) -> T.Dict[str, bool]:
@@ -264,7 +242,15 @@ def main() -> int:
     spreadsheet_id: str = cfg["spreadsheet_id"]
     fields: T.List[str] = cfg["fields"]
 
-    service = get_sheets_service()
+    # Service account path (required by sheet_tools.get_sheets_service)
+    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "credentials/google-service-account.json"
+    if not os.path.exists(sa_path):
+        raise FileNotFoundError(
+            f"Service account file not found at '{sa_path}'. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS to your key path."
+        )
+
+    service = get_sheets_service(sa_path)
 
     # Ensure base and alert tabs exist with headers
     RAW_HEADERS = fields[:]  # use config order for the base sheet
@@ -299,7 +285,8 @@ def main() -> int:
     # Status line on each alert tab when zero matches
     for name, tab in ALERT_TABS.items():
         if total_matches[name] == 0:
-            write_status(service, spreadsheet_id, tab, f"No matches this run at {datetime.utcnow().strftime('%Y-%m-%d %H:%MZ')}")
+            ts = datetime.utcnow().strftime('%Y-%m-%d %H:%MZ')
+            write_status(service, spreadsheet_id, tab, f"No matches this run at {ts}")
 
     # Console summary
     if wrote_any and all(v == 0 for v in total_matches.values()):
