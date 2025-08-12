@@ -1,210 +1,228 @@
-# fetch_and_write.py
-# WaveWatchr_Excel – fetch buoy data, filter for alerts, write to Google Sheets
-# Requires: google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib, requests, python-dateutil
+from __future__ import annotations
 
+import csv
+import io
 import os
-import json
+import sys
 import time
+import json
+import math
 import requests
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+from sheet_tools import get_sheets_service, ensure_tab, append_rows, write_status
+from rules import longboard_ok, shortboard_ok, short_period_ok
 
-# ---- Config ----
-SPREADSHEET_ID = os.environ.get("GOOGLE_SHEET_ID")  # must be set in your repo secret or env
-BUOY_STATION = os.environ.get("NDBC_STATION", "41117")
-# NDBC JSON endpoint (10‑min realtime)
-NDBC_URL = f"https://www.ndbc.noaa.gov/data/realtime2/{BUOY_STATION}.json"
 
-# Sheets
-TAB_BUOY = "buoy_data"
-TAB_LONG = "Longboard Alert"
-TAB_SHORT = "Shortboard Alert"
-TAB_SP = "Short Period Alerts"
+# ---------- Configuration ----------
+STATION_CONFIG_PATH = "station_config.json"  # contains station + sheet info
+SERVICE_ACCOUNT_PATH = "credentials/google-service-account.json"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Tabs
+RAW_TAB = "buoy_data"
+LONGBOARD_TAB = "Longboard Alert"
+SHORTBOARD_TAB = "Shortboard Alert"
+SHORTPER_TAB = "Short Period Alerts"
 
-# ---- Helpers ----
+# Headers for tabs
+RAW_HEADERS = [
+    "timestamp_utc", "station_id",
+    "wvht_ft", "dpd_s", "apd_s", "mwd_deg", "swh_ft", "swp_s", "swd_text"
+]
+ALERT_HEADERS = [
+    "timestamp_utc", "station_id",
+    "wvht_ft", "dpd_s", "apd_s", "mwd_deg", "swd_text"
+]
 
-def load_gcp_credentials() -> Credentials:
-    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials/google-service-account.json")
-    creds = Credentials.from_service_account_file(sa_path, scopes=SCOPES)
-    return creds
 
-def get_sheets(creds: Credentials):
-    return build("sheets", "v4", credentials=creds).spreadsheets()
+# ---------- Helpers ----------
+def compass_text(deg: float) -> str:
+    """Convert degrees to 16‑point compass text."""
+    if deg is None or math.isnan(deg):
+        return ""
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+            "S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    idx = int((deg/22.5)+0.5) % 16
+    return dirs[idx]
 
-def ensure_sheet(spreadsheets, title: str):
-    meta = spreadsheets.get(spreadsheetId=SPREADSHEET_ID).execute()
-    sheets = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
-    if title in sheets:
-        return sheets[title]
-    # add sheet
-    body = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
-    spreadsheets.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
-    # fetch id after creation
-    meta = spreadsheets.get(spreadsheetId=SPREADSHEET_ID).execute()
-    return {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}[title]
 
-def clear_sheet(spreadsheets, title: str):
-    spreadsheets.values().clear(
-        spreadsheetId=SPREADSHEET_ID, range=f"{title}!A:Z", body={}
-    ).execute()
-
-def append_rows(spreadsheets, title: str, rows: List[List]):
-    spreadsheets.values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{title}!A1",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows},
-    ).execute()
-
-def write_header_if_empty(spreadsheets, title: str, header: List[str]):
-    resp = spreadsheets.values().get(
-        spreadsheetId=SPREADSHEET_ID, range=f"{title}!A1:Z1"
-    ).execute()
-    values = resp.get("values", [])
-    if not values:
-        append_rows(spreadsheets, title, [header])
-
-# ---- Data & Filters ----
-
-def fetch_ndbc_json() -> List[Dict]:
-    # NDBC sometimes serves JSON lines; handle array + lines.
-    r = requests.get(NDBC_URL, timeout=20)
+def fetch_ndbc_txt(station: str) -> str:
+    url = f"https://www.ndbc.noaa.gov/data/realtime2/{station}.txt"
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
-    text = r.text.strip()
-    if text.startswith("["):
-        return r.json()
-    # Try JSON per line
-    out = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            # skip non-JSON lines
-            pass
-    return out
+    return r.text
 
-def normalize_row(d: Dict) -> Dict:
-    # Expected keys (best-effort; default None)
-    return {
-        "timestamp_utc": d.get("time", d.get("timestamp")),
-        "station_id": d.get("station", BUOY_STATION),
-        "wvht_ft": safe_float(d.get("WVHT")),         # significant wave height (ft)
-        "dpd_s": safe_float(d.get("DPD")),            # dominant period (s)
-        "apd_s": safe_float(d.get("APD")),            # average period (s)
-        "mwd_deg": safe_float(d.get("MWD")),          # mean wave direction (deg true)
-        "swh_ft": safe_float(d.get("SwH")),           # swell height (ft) – if available
-        "swp_s": safe_float(d.get("SwP")),            # swell period (s)
-        "swd_deg": safe_float(d.get("SwD")),          # swell direction (deg true)
+
+def parse_ndbc_latest_row(txt: str) -> Tuple[Dict, List[str]]:
+    """
+    Parse the realtime2 TXT and return a dict for the most recent row
+    plus the ordered header names we mapped.
+
+    The file is space-separated with header lines starting '#'.
+    """
+    # Strip comment lines, keep header line starting with '#YY'
+    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    header_line = None
+    data_lines: List[str] = []
+    for ln in lines:
+        if ln.startswith("#YY"):
+            header_line = ln.lstrip("#").strip()
+        elif not ln.startswith("#"):
+            data_lines.append(ln)
+
+    if not header_line or not data_lines:
+        raise ValueError("Could not find header or data in NDBC feed.")
+
+    # Normalize spaces → CSV for robust parsing
+    header_csv = ",".join(header_line.split())
+    latest_csv = ",".join(data_lines[0].split())  # first data line is most recent
+
+    header = header_csv.split(",")
+    values = latest_csv.split(",")
+
+    # Build mapping
+    rec = dict(zip(header, values))
+
+    # Build timestamp in UTC
+    # Columns typically: YY MM DD hh mm ...
+    try:
+        YY = int(rec.get("YY"))
+        MM = int(rec.get("MM"))
+        DD = int(rec.get("DD"))
+        hh = int(rec.get("hh"))
+        mm = int(rec.get("mm"))
+        # NDBC YY is 4-digit year already on realtime2
+        dt = datetime(YY, MM, DD, hh, mm, tzinfo=timezone.utc)
+    except Exception:
+        dt = datetime.now(timezone.utc)
+
+    # Pull numeric fields (some may be MM for missing)
+    def f(num_str: str) -> float:
+        try:
+            x = float(num_str)
+            if math.isfinite(x):
+                return x
+            return float("nan")
+        except Exception:
+            return float("nan")
+
+    WVHT_m = f(rec.get("WVHT", "nan"))  # significant wave height (meters)
+    DPD = f(rec.get("DPD", "nan"))      # dominant period (s)
+    APD = f(rec.get("APD", "nan"))      # average period (s)
+    MWD = f(rec.get("MWD", "nan"))      # mean wave direction (deg)
+
+    WVHT_ft = WVHT_m * 3.28084 if math.isfinite(WVHT_m) else float("nan")
+    SWH_ft = WVHT_ft  # keep column naming consistent with earlier sheet
+    SWD_text = compass_text(MWD)
+
+    row_dict = {
+        "timestamp_utc": dt.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "WVHT_ft": f"{WVHT_ft:.2f}" if math.isfinite(WVHT_ft) else "",
+        "DPD": f"{DPD:.1f}" if math.isfinite(DPD) else "",
+        "APD": f"{APD:.1f}" if math.isfinite(APD) else "",
+        "MWD": f"{MWD:.0f}" if math.isfinite(MWD) else "",
+        "SWH_ft": f"{SWH_ft:.2f}" if math.isfinite(SWH_ft) else "",
+        "SWP_s": f"{DPD:.1f}" if math.isfinite(DPD) else "",  # keep legacy column name
+        "SWD_text": SWD_text,
     }
 
-def safe_float(x):
-    try:
-        if x is None or x == "MM":
-            return None
-        return float(x)
-    except Exception:
-        return None
+    return row_dict, header
 
-def dir_is_NE_to_SE(deg: float) -> bool:
-    # 25° to 160° inclusive
-    return deg is not None and 25.0 <= deg <= 160.0
 
-def filter_longboard(rows: List[Dict]) -> List[Dict]:
-    # Long Period Swell alert for Longboarders:
-    # SwP > 13 AND SwH > 0.7 AND SwD between 25° and 160°
-    out = []
-    for r in rows:
-        if (r["swp_s"] is not None and r["swp_s"] > 13.0 and
-            r["swh_ft"] is not None and r["swh_ft"] > 0.7 and
-            r["swd_deg"] is not None and dir_is_NE_to_SE(r["swd_deg"])):
-            out.append(r)
-    return out
+def load_config(path: str) -> Dict:
+    with open(path, "r") as f:
+        return json.load(f)
 
-def filter_shortboard(rows: List[Dict]) -> List[Dict]:
-    # Long Period Swell alert for Shortboarders:
-    # SwP > 13 AND SwH > 1.6 AND SwD between 25° and 160°
-    out = []
-    for r in rows:
-        if (r["swp_s"] is not None and r["swp_s"] > 13.0 and
-            r["swh_ft"] is not None and r["swh_ft"] > 1.6 and
-            r["swd_deg"] is not None and dir_is_NE_to_SE(r["swd_deg"])):
-            out.append(r)
-    return out
 
-def filter_short_period(rows: List[Dict]) -> List[Dict]:
-    # Short Period alert for all:
-    # WVHT > 3 AND MWD between 25° and 160°
-    out = []
-    for r in rows:
-        if (r["wvht_ft"] is not None and r["wvht_ft"] > 3.0 and
-            r["mwd_deg"] is not None and dir_is_NE_to_SE(r["mwd_deg"])):
-            out.append(r)
-    return out
+def to_raw_row(station_id: str, parsed: Dict) -> List:
+    return [
+        parsed["timestamp_utc"],
+        station_id,
+        parsed["WVHT_ft"] or "",
+        parsed["DPD"] or "",
+        parsed["APD"] or "",
+        parsed["MWD"] or "",
+        parsed["SWH_ft"] or "",
+        parsed["SWP_s"] or "",
+        parsed["SWD_text"] or "",
+    ]
 
-def rows_to_values(rows: List[Dict]) -> List[List]:
-    header = ["timestamp_utc","station_id","wvht_ft","dpd_s","apd_s",
-              "mwd_deg","swh_ft","swp_s","swd_deg"]
-    values = []
-    for r in rows:
-        values.append([
-            r["timestamp_utc"], r["station_id"], r["wvht_ft"], r["dpd_s"],
-            r["apd_s"], r["mwd_deg"], r["swh_ft"], r["swp_s"], r["swd_deg"]
-        ])
-    return header, values
 
-# ---- Main ----
+def to_alert_row(station_id: str, parsed: Dict) -> List:
+    return [
+        parsed["timestamp_utc"],
+        station_id,
+        parsed["WVHT_ft"] or "",
+        parsed["DPD"] or "",
+        parsed["APD"] or "",
+        parsed["MWD"] or "",
+        parsed["SWD_text"] or "",
+    ]
+
 
 def main():
-    print(f"Fetching NDBC data for station {BUOY_STATION} …")
-    raw = fetch_ndbc_json()
-    if not raw:
-        raise RuntimeError("No data from NDBC.")
-    rows = [normalize_row(d) for d in raw]
+    cfg = load_config(STATION_CONFIG_PATH)
+    station_id = str(cfg["station_id"]).strip()
+    spreadsheet_id = cfg["spreadsheet_id"].strip()
 
-    # Filter
-    long_rows = filter_longboard(rows)
-    short_rows = filter_shortboard(rows)
-    sp_rows = filter_short_period(rows)
+    print(f"Fetching NDBC data for station {station_id} …")
+    txt = fetch_ndbc_txt(station_id)
+    parsed, _header = parse_ndbc_latest_row(txt)
 
-    print(f"Matches — Longboard: {len(long_rows)} | Shortboard: {len(short_rows)} | Short Period: {len(sp_rows)}")
+    # Build Google Sheets service
+    service = get_sheets_service(SERVICE_ACCOUNT_PATH)
 
-    # Sheets client
-    creds = load_gcp_credentials()
-    spreadsheets = get_sheets(creds)
+    # Ensure tabs + headers
+    ensure_tab(service, spreadsheet_id, RAW_TAB, RAW_HEADERS)
+    ensure_tab(service, spreadsheet_id, LONGBOARD_TAB, ALERT_HEADERS)
+    ensure_tab(service, spreadsheet_id, SHORTBOARD_TAB, ALERT_HEADERS)
+    ensure_tab(service, spreadsheet_id, SHORTPER_TAB, ALERT_HEADERS)
 
-    # Always ensure tabs exist + header on first write
-    for tab in (TAB_LONG, TAB_SHORT, TAB_SP):
-        ensure_sheet(spreadsheets, tab)
+    # Raw write
+    raw_row = to_raw_row(station_id, parsed)
+    append_rows(service, spreadsheet_id, RAW_TAB, [raw_row])
 
-    # Write each tab
-    write_alert_block(spreadsheets, TAB_LONG, "Longboard", long_rows)
-    write_alert_block(spreadsheets, TAB_SHORT, "Shortboard", short_rows)
-    write_alert_block(spreadsheets, TAB_SP, "Short Period", sp_rows)
+    # Evaluate rules
+    # Use numeric forms for rules
+    numeric_row = {
+        "DPD": float(parsed["DPD"]) if parsed["DPD"] else float("nan"),
+        "APD": float(parsed["APD"]) if parsed["APD"] else float("nan"),
+        "WVHT_ft": float(parsed["WVHT_ft"]) if parsed["WVHT_ft"] else float("nan"),
+        "MWD": float(parsed["MWD"]) if parsed["MWD"] else float("nan"),
+    }
 
-    print("Done.")
+    matches = 0
+    status_msgs = []
 
-def write_alert_block(spreadsheets, tab_title: str, label: str, rows: List[Dict]):
-    header, values = rows_to_values(rows)
-    write_header_if_empty(spreadsheets, tab_title, header)
+    if longboard_ok(numeric_row):
+        append_rows(service, spreadsheet_id, LONGBOARD_TAB, [to_alert_row(station_id, parsed)])
+        matches += 1
+        status_msgs.append("Longboard ✓")
 
-    if values:
-        append_rows(spreadsheets, tab_title, values)
-        print(f"Wrote {len(values)} {label} alert row(s) to '{tab_title}'.")
+    if shortboard_ok(numeric_row):
+        append_rows(service, spreadsheet_id, SHORTBOARD_TAB, [to_alert_row(station_id, parsed)])
+        matches += 1
+        status_msgs.append("Shortboard ✓")
+
+    if short_period_ok(numeric_row):
+        append_rows(service, spreadsheet_id, SHORTPER_TAB, [to_alert_row(station_id, parsed)])
+        matches += 1
+        status_msgs.append("Short Period ✓")
+
+    # Always drop a status crumb on each alert tab so we can tell it ran
+    stamp = parsed["timestamp_utc"]
+    if matches == 0:
+        msg = f"{stamp} – ran, no alert matches"
     else:
-        # Ensure the tab shows activity even with zero matches
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-        status_row = [f"No {label} alerts at {ts}"] + [""] * (len(header) - 1)
-        append_rows(spreadsheets, tab_title, [status_row])
-        print(f"No {label} alerts — appended status row to '{tab_title}'.")
+        msg = f"{stamp} – wrote {matches} alert row(s): {', '.join(status_msgs)}"
+
+    write_status(service, spreadsheet_id, LONGBOARD_TAB, msg)
+    write_status(service, spreadsheet_id, SHORTBOARD_TAB, msg)
+    write_status(service, spreadsheet_id, SHORTPER_TAB, msg)
+
+    print(msg)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

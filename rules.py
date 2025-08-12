@@ -1,42 +1,35 @@
-# rules.py
-from typing import Dict, Tuple
+from typing import Dict
 
-DIR_MIN = 25.0   # deg true
-DIR_MAX = 160.0  # deg true
-
-def _f(d: Dict, key: str) -> float:
-    """Safe float getter (blank/missing -> NaN)."""
-    v = (d.get(key) or "").strip()
+def within_direction_window(mwd_deg: float) -> bool:
+    """Return True if direction is between 25° and 160° inclusive (NE→SE window)."""
     try:
-        return float(v)
-    except Exception:
-        return float("nan")
+        d = float(mwd_deg)
+    except (TypeError, ValueError):
+        return False
+    return 25.0 <= d <= 160.0
 
-def _dir_in_window(deg: float) -> bool:
-    return (deg >= DIR_MIN) and (deg <= DIR_MAX)
+def longboard_ok(row: Dict) -> bool:
+    """Long period swell for longboarders: DPD >= 13s AND WVHT_ft >= 0.7 AND dir window."""
+    try:
+        dpd = float(row.get("DPD", "nan"))
+        wvht_ft = float(row.get("WVHT_ft", "nan"))
+    except (TypeError, ValueError):
+        return False
+    return (dpd >= 13.0) and (wvht_ft >= 0.7) and within_direction_window(row.get("MWD"))
 
-def longboard_ok(row: Dict) -> Tuple[bool, str]:
-    """SwP > 13s AND SwH > 0.7 AND SWD in [25,160]."""
-    swp = _f(row, "SwP")   # swell period (s)
-    swh = _f(row, "SwH")   # swell height (m)
-    swd = _f(row, "SWD")   # swell direction (deg true)
-    ok = (swp > 13.0) and (swh > 0.7) and _dir_in_window(swd)
-    why = f"SwP={swp:g}s, SwH={swh:g}m, SWD={swd:g}°"
-    return ok, why
+def shortboard_ok(row: Dict) -> bool:
+    """Long period swell for shortboarders: DPD >= 13s AND WVHT_ft >= 1.6 AND dir window."""
+    try:
+        dpd = float(row.get("DPD", "nan"))
+        wvht_ft = float(row.get("WVHT_ft", "nan"))
+    except (TypeError, ValueError):
+        return False
+    return (dpd >= 13.0) and (wvht_ft >= 1.6) and within_direction_window(row.get("MWD"))
 
-def shortboard_ok(row: Dict) -> Tuple[bool, str]:
-    """SwP > 13s AND SwH > 1.6 AND SWD in [25,160]."""
-    swp = _f(row, "SwP")
-    swh = _f(row, "SwH")
-    swd = _f(row, "SWD")
-    ok = (swp > 13.0) and (swh > 1.6) and _dir_in_window(swd)
-    why = f"SwP={swp:g}s, SwH={swh:g}m, SWD={swd:g}°"
-    return ok, why
-
-def short_period_ok(row: Dict) -> Tuple[bool, str]:
-    """WVHT > 3 (m) AND mean wave direction in [25,160]."""
-    wvht = _f(row, "WVHT")  # significant wave height (m)
-    mwd  = _f(row, "MWD")   # mean wave direction (deg true)
-    ok = (wvht > 3.0) and _dir_in_window(mwd)
-    why = f"WVHT={wvht:g}m, MWD={mwd:g}°"
-    return ok, why
+def short_period_ok(row: Dict) -> bool:
+    """Short period alert for all: WVHT_ft >= 3 AND dir window (period unconstrained)."""
+    try:
+        wvht_ft = float(row.get("WVHT_ft", "nan"))
+    except (TypeError, ValueError):
+        return False
+    return (wvht_ft >= 3.0) and within_direction_window(row.get("MWD"))
