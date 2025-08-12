@@ -1,6 +1,5 @@
 {
-  "station_id": "41117",
-  "spreadsheet_id": "1OZQM-_X_sVgGYtD3YFFJH5C3nYuCDb3BBDjCw6yu4HQ",
+  "stations": ["41117"],
   "fields": [
     "timestamp_utc",
     "wave_height_ft",

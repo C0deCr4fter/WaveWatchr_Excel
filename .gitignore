@@ -4,3 +4,9 @@ __pycache__/
 data/*.xlsx
 .env
 credentials/*.json
+env/
+__pycache__/
+*.pyc
+credentials/
+service_account.json
+*.key.json
