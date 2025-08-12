@@ -1,14 +1,14 @@
 {
-  "stations": ["41117"],
+  "station_id": "41117",
   "fields": [
     "timestamp_utc",
     "station_id",
-    "wvht_ft",         
-    "dpd_s",           
-    "apd_s",           
-    "mwd_deg",         
-    "swh_ft",          
-    "swp_s",           
-    "swd_text"         
+    "wvht_ft",
+    "dpd_s",
+    "apd_s",
+    "mwd_deg",
+    "swh_ft",
+    "swp_s",
+    "swd_text"
   ]
 }
