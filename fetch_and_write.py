@@ -3,128 +3,69 @@
 WaveWatchr_Excel • fetch_and_write.py
 
 - Loads config from STATION_CONFIG_JSON (env) or station_config.json (file)
-- Supports both "station_id" and "stations" schemas
 - Uses GOOGLE_SHEET_ID if set, else cfg["spreadsheet_id"]
-- Fetches latest observation from NDBC realtime feeds
-- Writes a base row to the buoy_data tab
-- Evaluates alert rules and appends matches to alert tabs
-- Prints a simple summary ("ran, no alert matches" or counts)
-
-Dependencies: google-api-python-client, google-auth, requests
-Relies on local helper modules: sheet_tools.py, rules.py
+- Supports "station_id" or "stations" in config
+- Fetches latest from NDBC realtime2 <station>.txt and <station>.spec
+- Writes base row to 'buoy_data' using short headers
+- Appends matches to alert tabs
 """
 
 from __future__ import annotations
-
-import os
-import sys
-import json
-import math
-import typing as T
+import os, sys, json, math, typing as T
 from datetime import datetime, timezone
-
 import requests
 
-from sheet_tools import (
-    get_sheets_service,   # NOTE: requires sa_path argument
-    ensure_tab,
-    append_rows,
-    write_status,
-)
+from sheet_tools import get_sheets_service, ensure_tab, append_rows, write_status
+from rules import longboard_ok, shortboard_ok, short_period_ok  # backward-compatible names
 
-# Backward-compatible rule imports (our rules.py exposes both names)
-from rules import longboard_ok, shortboard_ok, short_period_ok
-
-# --------- Constants ----------
-RAW_TAB = "buoy_data"  # change if your base tab has a different name
+RAW_TAB = "buoy_data"
 ALERT_TABS = {
     "Longboard": "Longboard Alert",
     "Shortboard": "Shortboard Alert",
     "Short Period": "Short Period Alert",
 }
 
-# Default headers if config["fields"] is missing (we still honor cfg["fields"] if present)
-DEFAULT_FIELDS = [
-    "timestamp_utc",
-    "station_id",
-    "wave_height_ft",
-    "dominant_period_s",
-    "wind_dir_deg",
-    "wind_speed_kt",
-    "swell_height_ft",
-    "swell_period_s",
-    "wind_direction",
+# Canonical header order we’ll use everywhere (short names)
+FIELDS = [
+    "timestamp_utc", "station_id",
+    "wvht_ft",       # total wave height ft
+    "dpd_s",         # dominant period s
+    "apd_s",         # average period s
+    "mwd_deg",       # mean wave direction deg true
+    "swh_ft",        # swell height ft
+    "swp_s",         # swell period s
+    "swd_text",      # direction text (ENE, E, etc.)
 ]
 
-# NDBC endpoints
-NDBC_STD_URL = "https://www.ndbc.noaa.gov/data/realtime2/{station}.txt"
+NDBC_STD_URL  = "https://www.ndbc.noaa.gov/data/realtime2/{station}.txt"
 NDBC_SPEC_URL = "https://www.ndbc.noaa.gov/data/realtime2/{station}.spec"
-
 FT_PER_M = 3.28084
 
-
-# --------- Config loading ----------
-
-def load_config() -> dict:
-    """
-    Load JSON config from env var STATION_CONFIG_JSON or from station_config.json file.
-    Valid keys:
-      - station_id: "41117" (string)  OR  stations: ["41117", ...]
-      - spreadsheet_id: "google_sheet_id"
-      - fields: [list of column keys to write]
-    """
+def _json_config() -> dict:
     env_json = os.environ.get("STATION_CONFIG_JSON")
     if env_json:
-        cfg = json.loads(env_json)
-    else:
-        with open("station_config.json", "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        return json.loads(env_json)
+    with open("station_config.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    # Normalize stations
-    stations: T.List[str] = []
+def load_config() -> dict:
+    cfg = _json_config()
+    # stations
     if "stations" in cfg and isinstance(cfg["stations"], list):
         stations = [str(s).strip() for s in cfg["stations"] if str(s).strip()]
     elif "station_id" in cfg:
-        s = str(cfg["station_id"]).strip()
-        if s:
-            stations = [s]
+        stations = [str(cfg["station_id"]).strip()]
     else:
         raise KeyError("Config must contain 'stations' (list) or 'station_id' (string).")
 
-    # Determine spreadsheet_id (prefer env override)
+    # spreadsheet id
     spreadsheet_id = os.environ.get("GOOGLE_SHEET_ID") or cfg.get("spreadsheet_id", "").strip()
     if not spreadsheet_id:
-        raise KeyError("No spreadsheet ID found. Set GOOGLE_SHEET_ID or add 'spreadsheet_id' to the config.")
+        raise KeyError("Set GOOGLE_SHEET_ID or add 'spreadsheet_id' to the config.")
 
-    fields = cfg.get("fields") or DEFAULT_FIELDS
-    if not isinstance(fields, list) or not fields:
-        fields = DEFAULT_FIELDS
+    return {"stations": stations, "spreadsheet_id": spreadsheet_id}
 
-    return {
-        "stations": stations,
-        "spreadsheet_id": spreadsheet_id,
-        "fields": fields,
-    }
-
-
-# --------- Helpers ----------
-
-def to_iso_utc(year: int, mo: int, dy: int, hr: int, mn: int) -> str:
-    dt = datetime(year, mo, dy, hr, mn, tzinfo=timezone.utc)
-    # keep "+00:00" suffix explicit
-    return dt.isoformat().replace("+00:00", "+00:00")
-
-
-def deg_to_cardinal(deg: T.Optional[float]) -> T.Optional[str]:
-    if deg is None or (isinstance(deg, float) and math.isnan(deg)):
-        return None
-    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-    ix = int((float(deg) % 360) / 22.5 + 0.5) % 16
-    return dirs[ix]
-
-
-def safe_float(x: T.Any) -> T.Optional[float]:
+def _safe_float(x) -> T.Optional[float]:
     try:
         if x in ("MM", "", None):
             return None
@@ -132,171 +73,144 @@ def safe_float(x: T.Any) -> T.Optional[float]:
     except Exception:
         return None
 
+def _round1(x: T.Optional[float]) -> T.Optional[float]:
+    return None if x is None else round(float(x), 1)
 
-def m_to_ft(x_m: T.Optional[float]) -> T.Optional[float]:
-    if x_m is None:
+def _m_to_ft(x_m: T.Optional[float]) -> T.Optional[float]:
+    return None if x_m is None else round(x_m * FT_PER_M, 2)
+
+def _iso_utc(y,m,d,h,mi) -> str:
+    return datetime((2000 + y) if y < 100 else y, m, d, h, mi, tzinfo=timezone.utc).isoformat().replace("+00:00","+00:00")
+
+def _deg_to_cardinal(deg: T.Optional[float]) -> T.Optional[str]:
+    if deg is None or (isinstance(deg, float) and math.isnan(deg)):  # type: ignore[name-defined]
         return None
-    return round(x_m * FT_PER_M, 2)
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    ix = int((float(deg) % 360)/22.5 + 0.5) % 16
+    return dirs[ix]
 
-
-def round_1(x: T.Optional[float]) -> T.Optional[float]:
-    if x is None:
-        return None
-    return round(float(x), 1)
-
-
-# --------- NDBC parsing ----------
-
-def _parse_fixed_width_line(line: str) -> T.List[str]:
-    """NDBC realtime2 .txt and .spec are space-separated with variable spacing; split on whitespace."""
-    return line.strip().split()
-
-
-def _fetch_last_data_line(url: str) -> T.Optional[str]:
+def _fetch_first_data_line(url: str) -> T.Optional[str]:
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     lines = [ln for ln in r.text.splitlines() if ln and not ln.startswith("#")]
-    return lines[0] if lines else None  # Files are reverse-chron; newest is first
+    return lines[0] if lines else None  # newest first
 
-
-def fetch_latest_observation(station: str) -> dict:
+def fetch_latest_obs(station: str) -> dict:
     """
-    Pull the newest row by combining realtime2 <station>.txt and <station>.spec.
-    Returns a dict with keys we might need:
-      timestamp_utc, station_id, wave_height_ft, dominant_period_s,
-      wind_speed_kt, wind_dir_deg, wind_direction,
-      swell_height_ft, swell_period_s, mean_wave_dir_deg
+    Build an obs dict that includes BOTH canonical keys used by rules.py AND
+    short-header aliases used by the sheet.
     """
-    std_line = _fetch_last_data_line(NDBC_STD_URL.format(station=station))
-    spec_line = _fetch_last_data_line(NDBC_SPEC_URL.format(station=station))
+    std = _fetch_first_data_line(NDBC_STD_URL.format(station=station))
+    spec = _fetch_first_data_line(NDBC_SPEC_URL.format(station=station))
 
-    result: dict = {
-        "station_id": station,
-    }
+    obs: dict = {"station_id": station}
 
-    # Parse standard file (..../<station>.txt)
-    # Header (reference): YY  MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD PRES ATMP WTMP DEWP VIS TIDE
-    if std_line:
-        parts = _parse_fixed_width_line(std_line)
-        if len(parts) >= 11:
-            yr, mo, dy, hh, mn = map(int, parts[0:5])
-            wdir = safe_float(parts[5])
-            wspd = safe_float(parts[6])   # likely m/s; we'll convert to kt
-            wvht_m = safe_float(parts[8])
-            dpd = safe_float(parts[9])
-            mwd = safe_float(parts[11]) if len(parts) > 11 else None
+    # ---- standard file (.txt)
+    # Header: YY MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD PRES ATMP WTMP DEWP VIS TIDE
+    if std:
+        p = std.strip().split()
+        if len(p) >= 12:
+            yy, mm, dd, hh, mi = map(int, p[0:5])
+            wdir = _safe_float(p[5])
+            wspd_ms = _safe_float(p[6])
+            wvht_m  = _safe_float(p[8])
+            dpd_s   = _safe_float(p[9])
+            apd_s   = _safe_float(p[10])
+            mwd_deg = _safe_float(p[11])
 
-            result["timestamp_utc"] = to_iso_utc(2000 + yr if yr < 100 else yr, mo, dy, hh, mn)
-            result["wave_height_ft"] = round_1(m_to_ft(wvht_m))
-            result["dominant_period_s"] = round_1(dpd)
+            obs["timestamp_utc"] = _iso_utc(yy, mm, dd, hh, mi)
+            # canonical long keys
+            obs["wave_height_ft"]    = _round1(_m_to_ft(wvht_m))
+            obs["dominant_period_s"] = _round1(dpd_s)
+            obs["mean_wave_dir_deg"] = mwd_deg
+            obs["wind_dir_deg"]      = wdir
+            obs["wind_speed_kt"]     = round(float(wspd_ms) * 1.94384) if wspd_ms is not None else None
+            obs["wind_direction"]    = _deg_to_cardinal(wdir)
+            # short aliases for sheet
+            obs["wvht_ft"] = obs["wave_height_ft"]
+            obs["dpd_s"]   = obs["dominant_period_s"]
+            obs["apd_s"]   = _round1(apd_s)
+            obs["mwd_deg"] = mwd_deg
+            obs["swd_text"]= obs["wind_direction"]
 
-            wind_speed_kt = None
-            if wspd is not None:
-                wind_speed_kt = round(float(wspd) * 1.94384)  # m/s → kt
-
-            result["wind_dir_deg"] = wdir
-            result["wind_speed_kt"] = wind_speed_kt
-            result["wind_direction"] = deg_to_cardinal(wdir)
-            result["mean_wave_dir_deg"] = mwd
-
-    # Parse spectral file (..../<station>.spec)
-    # Header:
-    # YY  MM DD hh mm WVHT  SwH  SwP  WWH  WWP SwD WWD  STEEPNESS  APD MWD
-    if spec_line:
-        parts = _parse_fixed_width_line(spec_line)
-        if len(parts) >= 10:
-            swh_m = safe_float(parts[6])   # SwH (m)
-            swp_s = safe_float(parts[7])   # SwP (s)
-            # MWD often appears as the last numeric
+    # ---- spectral file (.spec)
+    # Header: YY MM DD hh mm WVHT SwH SwP WWH WWP SwD WWD STEEPNESS APD MWD
+    if spec:
+        p = spec.strip().split()
+        if len(p) >= 10:
+            swh_m = _safe_float(p[6])   # SwH
+            swp_s = _safe_float(p[7])   # SwP
             try:
-                mwd_tail = safe_float(parts[-1])
+                mwd_tail = _safe_float(p[-1])
             except Exception:
                 mwd_tail = None
 
-            result["swell_height_ft"] = round_1(m_to_ft(swh_m))
-            result["swell_period_s"] = round_1(swp_s)
-            if result.get("mean_wave_dir_deg") is None and mwd_tail is not None:
-                result["mean_wave_dir_deg"] = mwd_tail
+            obs["swell_height_ft"] = _round1(_m_to_ft(swh_m))
+            obs["swell_period_s"]  = _round1(swp_s)
+            if obs.get("mean_wave_dir_deg") is None and mwd_tail is not None:
+                obs["mean_wave_dir_deg"] = mwd_tail
 
-    return result
+            # short aliases
+            obs["swh_ft"] = obs["swell_height_ft"]
+            obs["swp_s"]  = obs["swell_period_s"]
+            if obs.get("mwd_deg") is None and mwd_tail is not None:
+                obs["mwd_deg"] = mwd_tail
 
+    return obs
 
 def build_row(fields: T.List[str], obs: dict) -> T.List[T.Any]:
-    """Return a list of values in the same order as fields."""
     return [obs.get(k) for k in fields]
 
-
-def any_alerts_for_row(row_dict: dict) -> T.Dict[str, bool]:
+def any_alerts(row: dict) -> T.Dict[str,bool]:
     return {
-        "Longboard": bool(longboard_ok(row_dict)),
-        "Shortboard": bool(shortboard_ok(row_dict)),
-        "Short Period": bool(short_period_ok(row_dict)),
+        "Longboard":   bool(longboard_ok(row)),
+        "Shortboard":  bool(shortboard_ok(row)),
+        "Short Period":bool(short_period_ok(row)),
     }
-
-
-# --------- Main ----------
 
 def main() -> int:
     cfg = load_config()
-    stations: T.List[str] = cfg["stations"]
-    spreadsheet_id: str = cfg["spreadsheet_id"]
-    fields: T.List[str] = cfg["fields"]
-
-    # Service account path (required by sheet_tools.get_sheets_service)
+    stations        = cfg["stations"]
+    spreadsheet_id  = cfg["spreadsheet_id"]
     sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "credentials/google-service-account.json"
     if not os.path.exists(sa_path):
-        raise FileNotFoundError(
-            f"Service account file not found at '{sa_path}'. "
-            "Set GOOGLE_APPLICATION_CREDENTIALS to your key path."
-        )
-
+        raise FileNotFoundError(f"Service account file not found at '{sa_path}'")
     service = get_sheets_service(sa_path)
 
-    # Ensure base and alert tabs exist with headers
-    RAW_HEADERS = fields[:]  # use config order for the base sheet
-    ensure_tab(service, spreadsheet_id, RAW_TAB, RAW_HEADERS)
+    # Ensure tabs with our standardized headers
+    ensure_tab(service, spreadsheet_id, RAW_TAB, FIELDS)
     for tab in ALERT_TABS.values():
-        ensure_tab(service, spreadsheet_id, tab, RAW_HEADERS)
+        ensure_tab(service, spreadsheet_id, tab, FIELDS)
 
-    total_matches = {"Longboard": 0, "Shortboard": 0, "Short Period": 0}
+    totals = {"Longboard":0,"Shortboard":0,"Short Period":0}
     wrote_any = False
 
-    for station_id in stations:
-        print(f"Fetching NDBC data for station {station_id} …", flush=True)
-        obs = fetch_latest_observation(station_id)
-
-        # Enforce station_id and round height if it exists
-        obs["station_id"] = station_id
-        if "wave_height_ft" in obs and obs["wave_height_ft"] is not None:
-            obs["wave_height_ft"] = round_1(obs["wave_height_ft"])
-
-        # Build row in the same order as headers
-        row = build_row(fields, obs)
+    for st in stations:
+        print(f"Fetching NDBC data for station {st} …", flush=True)
+        obs = fetch_latest_obs(st)
+        obs["station_id"] = st  # enforce
+        row = build_row(FIELDS, obs)
         append_rows(service, spreadsheet_id, RAW_TAB, [row])
         wrote_any = True
 
-        # Check alerts
-        flags = any_alerts_for_row(obs)
+        flags = any_alerts(obs)
         for name, hit in flags.items():
             if hit:
                 append_rows(service, spreadsheet_id, ALERT_TABS[name], [row])
-                total_matches[name] += 1
+                totals[name] += 1
 
-    # Status line on each alert tab when zero matches
+    # status lines if zero matches
+    ts = datetime.utcnow().strftime('%Y-%m-%d %H:%MZ')
     for name, tab in ALERT_TABS.items():
-        if total_matches[name] == 0:
-            ts = datetime.utcnow().strftime('%Y-%m-%d %H:%MZ')
+        if totals[name] == 0:
             write_status(service, spreadsheet_id, tab, f"No matches this run at {ts}")
 
-    # Console summary
-    if wrote_any and all(v == 0 for v in total_matches.values()):
+    if wrote_any and all(v==0 for v in totals.values()):
         print(f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S+0000')} – ran, no alert matches")
     else:
-        parts = [f"{k}:{v}" for k, v in total_matches.items()]
-        print(f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S+0000')} – matches " + ", ".join(parts))
-
+        print(f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S+0000')} – matches " +
+              ", ".join(f"{k}:{v}" for k,v in totals.items()))
     return 0
-
 
 if __name__ == "__main__":
     try:
