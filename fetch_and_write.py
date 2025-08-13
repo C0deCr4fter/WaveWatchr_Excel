@@ -25,7 +25,7 @@ ALERT_TABS = {
     "Short Period": "Short Period Alert",
 }
 
-# Canonical header order we’ll use everywhere (short names)
+# Canonical header order used everywhere (short names)
 FIELDS = [
     "timestamp_utc", "station_id",
     "wvht_ft",       # total wave height ft
@@ -41,6 +41,7 @@ NDBC_STD_URL  = "https://www.ndbc.noaa.gov/data/realtime2/{station}.txt"
 NDBC_SPEC_URL = "https://www.ndbc.noaa.gov/data/realtime2/{station}.spec"
 FT_PER_M = 3.28084
 
+# ---------- config ----------
 def _json_config() -> dict:
     env_json = os.environ.get("STATION_CONFIG_JSON")
     if env_json:
@@ -50,7 +51,6 @@ def _json_config() -> dict:
 
 def load_config() -> dict:
     cfg = _json_config()
-    # stations
     if "stations" in cfg and isinstance(cfg["stations"], list):
         stations = [str(s).strip() for s in cfg["stations"] if str(s).strip()]
     elif "station_id" in cfg:
@@ -58,13 +58,13 @@ def load_config() -> dict:
     else:
         raise KeyError("Config must contain 'stations' (list) or 'station_id' (string).")
 
-    # spreadsheet id
     spreadsheet_id = os.environ.get("GOOGLE_SHEET_ID") or cfg.get("spreadsheet_id", "").strip()
     if not spreadsheet_id:
         raise KeyError("Set GOOGLE_SHEET_ID or add 'spreadsheet_id' to the config.")
 
     return {"stations": stations, "spreadsheet_id": spreadsheet_id}
 
+# ---------- utils ----------
 def _safe_float(x) -> T.Optional[float]:
     try:
         if x in ("MM", "", None):
@@ -95,6 +95,7 @@ def _fetch_first_data_line(url: str) -> T.Optional[str]:
     lines = [ln for ln in r.text.splitlines() if ln and not ln.startswith("#")]
     return lines[0] if lines else None  # newest first
 
+# ---------- data fetch ----------
 def fetch_latest_obs(station: str) -> dict:
     """
     Build an obs dict that includes BOTH canonical keys used by rules.py AND
@@ -106,7 +107,7 @@ def fetch_latest_obs(station: str) -> dict:
     obs: dict = {"station_id": station}
 
     # ---- standard file (.txt)
-    # Header: YY MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD PRES ATMP WTMP DEWP VIS TIDE
+    # YY MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD ...
     if std:
         p = std.strip().split()
         if len(p) >= 12:
@@ -119,22 +120,21 @@ def fetch_latest_obs(station: str) -> dict:
             mwd_deg = _safe_float(p[11])
 
             obs["timestamp_utc"] = _iso_utc(yy, mm, dd, hh, mi)
-            # canonical long keys
             obs["wave_height_ft"]    = _round1(_m_to_ft(wvht_m))
             obs["dominant_period_s"] = _round1(dpd_s)
             obs["mean_wave_dir_deg"] = mwd_deg
             obs["wind_dir_deg"]      = wdir
             obs["wind_speed_kt"]     = round(float(wspd_ms) * 1.94384) if wspd_ms is not None else None
             obs["wind_direction"]    = _deg_to_cardinal(wdir)
-            # short aliases for sheet
+
+            # short aliases
             obs["wvht_ft"] = obs["wave_height_ft"]
             obs["dpd_s"]   = obs["dominant_period_s"]
             obs["apd_s"]   = _round1(apd_s)
             obs["mwd_deg"] = mwd_deg
-            obs["swd_text"]= obs["wind_direction"]
 
     # ---- spectral file (.spec)
-    # Header: YY MM DD hh mm WVHT SwH SwP WWH WWP SwD WWD STEEPNESS APD MWD
+    # YY MM DD hh mm WVHT SwH SwP WWH WWP SwD WWD STEEPNESS APD MWD
     if spec:
         p = spec.strip().split()
         if len(p) >= 10:
@@ -156,8 +156,17 @@ def fetch_latest_obs(station: str) -> dict:
             if obs.get("mwd_deg") is None and mwd_tail is not None:
                 obs["mwd_deg"] = mwd_tail
 
+    # ---- final swd_text (prefer wave direction over wind) ----
+    dir_for_card = (
+        obs.get("mwd_deg") or
+        obs.get("swell_dir_deg_true") or
+        obs.get("wind_dir_deg")
+    )
+    obs["swd_text"] = _deg_to_cardinal(dir_for_card)
+
     return obs
 
+# ---------- alerts ----------
 def build_row(fields: T.List[str], obs: dict) -> T.List[T.Any]:
     return [obs.get(k) for k in fields]
 
@@ -168,16 +177,18 @@ def any_alerts(row: dict) -> T.Dict[str,bool]:
         "Short Period":bool(short_period_ok(row)),
     }
 
+# ---------- main ----------
 def main() -> int:
     cfg = load_config()
     stations        = cfg["stations"]
     spreadsheet_id  = cfg["spreadsheet_id"]
+
     sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "credentials/google-service-account.json"
     if not os.path.exists(sa_path):
         raise FileNotFoundError(f"Service account file not found at '{sa_path}'")
     service = get_sheets_service(sa_path)
 
-    # Ensure tabs with our standardized headers
+    # Ensure tabs with standardized headers
     ensure_tab(service, spreadsheet_id, RAW_TAB, FIELDS)
     for tab in ALERT_TABS.values():
         ensure_tab(service, spreadsheet_id, tab, FIELDS)
